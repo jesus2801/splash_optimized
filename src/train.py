@@ -7,14 +7,24 @@ import torch.nn.functional as F
 from sklearn.utils.class_weight import compute_class_weight
 
 # ----------------------------
+# Selección de dispositivo
+# ----------------------------
+if torch.backends.mps.is_available():
+    device = "mps"
+    print("Using Apple Silicon GPU (MPS)")
+else:
+    device = "cpu"
+    print("Using CPU")
+
+# ----------------------------
 # 配置参数
 # ----------------------------
 class CustomConfig:
     # 数据参数
     data_yaml = "dataset/data.yaml"
-    img_size = 640
-    batch_size = 23
-    epochs = 100
+    img_size = 512
+    batch_size = 8
+    epochs = 30
     patience = 10 
     
     # 数据增强参数
@@ -40,7 +50,7 @@ class CustomConfig:
     focal_loss = True     # 启用焦点损失
     
     # 模型参数
-    pretrained = "yolo11x.pt"
+    pretrained = "yolo11s.pt"
     freeze = ['backbone', 'head']  # 冻结的层
     multi_scale = True    # 多尺度训练
 
@@ -105,8 +115,7 @@ class CustomLoss:
 
 def train_yolo(config):
     # 初始化模型
-    model_path = '/root/.cache/torch/hub/checkpoints/yolo11x.pt'  # 指定缓存路径
-    model = YOLO(model_path)  # 使用本地路径加载模型
+    model = YOLO(config.pretrained)
     model.loss = CustomLoss(model, class_weights=config.class_weights)
 
     # 冻结指定层
@@ -128,6 +137,7 @@ def train_yolo(config):
         'epochs': config.epochs,
         'imgsz': config.img_size,
         'batch': config.batch_size,
+        'device': 'mps',
         'lr0': config.lr0,
         'lrf': config.lrf,
         'momentum': config.momentum,
