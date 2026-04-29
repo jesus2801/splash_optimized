@@ -1,196 +1,171 @@
+"""Stage 1 — train YOLOv12 on the public-pool dataset.
+
+This is the *base* training step. It produces a general-purpose drowning
+detector by fine-tuning a COCO-pretrained YOLOv12 checkpoint on the public
+swimming-pool dataset under ``dataset/``. The output weights are then used as
+the starting point for the domain-adaptation step in ``src/finetune.py``.
+
+Typical usage from the repo root:
+
+    python src/train.py
+    python src/train.py --model yolo12s.pt --epochs 80   # fast baseline
+    python src/train.py --resume                         # resume last run
+
+The defaults are tuned for an RTX 3050 6 GB Laptop GPU at ``imgsz=640``.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import torch
 import yaml
-import os
-import numpy as np
 from ultralytics import YOLO
-import torch.nn.functional as F
-from sklearn.utils.class_weight import compute_class_weight
 
-# ----------------------------
-# Selección de dispositivo
-# ----------------------------
-if torch.backends.mps.is_available():
-    device = "mps"
-    print("Using Apple Silicon GPU (MPS)")
-else:
-    device = "cpu"
-    print("Using CPU")
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATA = REPO_ROOT / "dataset" / "data.yaml"
+DEFAULT_PROJECT = REPO_ROOT / "runs" / "detect"
 
-# ----------------------------
-# 配置参数
-# ----------------------------
-class CustomConfig:
-    # 数据参数
-    data_yaml = "dataset/data.yaml"
-    img_size = 512
-    batch_size = 8
-    epochs = 30
-    patience = 10 
-    
-    # 数据增强参数
-    augment = {
-        'hsv_h': 0.015,
-        'hsv_s': 0.7,
-        'hsv_v': 0.4,
-        'translate': 0.1,
-        'scale': 0.9,
-        'fliplr': 0.5,
-        'mosaic': 1.0,  # 增加 Mosaic 增强的概率
-        'mixup': 0.2     # 增加 Mixup 的概率
-    }
-    
-    # 优化参数
-    lr0 = 0.001    # 初始学习率
-    lrf = 0.01    # 最终学习率
-    momentum = 0.937
-    weight_decay = 0.0005
-    
-    # 类别平衡参数
-    class_weights = None  # 自动计算
-    focal_loss = True     # 启用焦点损失
-    
-    # 模型参数
-    pretrained = "yolo11s.pt"
-    freeze = ['backbone', 'head']  # 冻结的层
-    multi_scale = True    # 多尺度训练
 
-    # IoU 阈值恢复为 0.5
-    iou_threshold = 0.5  # IoU阈值设置回0.5
+def normalize_data_yaml(data_yaml: Path) -> str:
+    """Rewrite ``data_yaml`` with an absolute ``path:`` and return the new path.
 
-# ----------------------------
-# 数据准备与类别平衡
-# ----------------------------
-def prepare_dataset(config):
-    # 分析数据集分布
-    with open(config.data_yaml) as f:
-        data = yaml.safe_load(f)
-    
-    # 计算类别权重
-    train_labels = []
-    train_label_dir = os.path.join(os.path.dirname(config.data_yaml), data['train'].replace('images', 'labels'))
-    for label_file in os.listdir(train_label_dir):
-        with open(os.path.join(train_label_dir, label_file)) as f:
-            for line in f.readlines():
-                class_id = int(line.strip().split()[0])
-                train_labels.append(class_id)
-    
-    classes = np.unique(train_labels)
-    weights = compute_class_weight('balanced', classes=classes, y=train_labels)
-    config.class_weights = {k:v for k,v in zip(classes, weights)}
-    
-    print(f"Class weights calculated: {config.class_weights}")
+    Ultralytics' ``check_det_dataset`` resolves the YAML's ``path:`` field
+    against the current working directory when it's relative (because
+    ``Path(".").exists()`` is True, the fallback to ``DATASETS_DIR`` is never
+    taken). Roboflow exports always use ``path: .`` and that breaks training
+    unless you happen to run ``python`` from inside the dataset folder.
 
-# ----------------------------
-# 自定义损失函数
-# ----------------------------
-class CustomLoss:
-    def __init__(self, model, class_weights=None, focal_gamma=2.0):
-        self.model = model
-        self.class_weights = class_weights
-        self.focal_gamma = focal_gamma
-    
-    def __call__(self, preds, targets):
-        # 修改默认损失计算
-        loss = self.model.compute_loss(preds, targets)
-        
-        # 应用类别权重
-        if self.class_weights:
-            cls_loss = loss[1]  # 分类损失分量
-            weighted_cls_loss = cls_loss * self.class_weights
-            loss[1] = weighted_cls_loss.mean()
-        
-        # 应用焦点损失
-        if CustomConfig.focal_loss:
-            p = torch.sigmoid(preds[..., 4:])
-            ce_loss = F.binary_cross_entropy_with_logits(p, targets, reduction='none')
-            alpha = torch.where(targets==1, 0.25, 0.75)  # 自定义alpha参数
-            focal_loss = alpha * (1 - p)**self.focal_gamma * ce_loss
-            loss[1] += focal_loss.mean()
-        
-        return loss.sum()
+    We dodge the whole problem by writing a sibling ``data.normalized.yaml``
+    where ``path:`` is the YAML's own absolute parent directory, which makes
+    every relative ``train: / val: / test:`` resolve correctly regardless of
+    where the user invoked the script from.
+    """
 
-# ----------------------------
-# 模型训练
-# ----------------------------
+    data_yaml = data_yaml.resolve()
+    if not data_yaml.is_file():
+        raise SystemExit(f"data.yaml not found: {data_yaml}")
 
-def train_yolo(config):
-    # 初始化模型
-    model = YOLO(config.pretrained)
-    model.loss = CustomLoss(model, class_weights=config.class_weights)
+    with data_yaml.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
 
-    # 冻结指定层
-    if config.freeze:
-        freeze = [f'model.{x}' for x in config.freeze]
-        for k, v in model.named_parameters():
-            if any(x in k for x in freeze):
-                v.requires_grad = False
+    raw_path = cfg.get("path", ".")
+    base = Path(raw_path)
+    if not base.is_absolute():
+        candidate = (data_yaml.parent / base).resolve()
+        base = candidate if candidate.is_dir() else data_yaml.parent
+    cfg["path"] = str(base)
 
-    # 设置优化器 (AdamW 或其他)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr0, weight_decay=config.weight_decay)
+    out_path = data_yaml.parent / "data.normalized.yaml"
+    with out_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    return str(out_path)
 
-    # 学习率调度器：Cosine Annealing
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
 
-    # 训练参数
-    train_args = {
-        'data': config.data_yaml,
-        'epochs': config.epochs,
-        'imgsz': config.img_size,
-        'batch': config.batch_size,
-        'device': 'mps',
-        'lr0': config.lr0,
-        'lrf': config.lrf,
-        'momentum': config.momentum,
-        'weight_decay': config.weight_decay,
-        'patience': config.patience,
-        'augment': True,
-        **config.augment
-    }
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Train YOLOv12 on the public pool dataset (stage 1).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--data", default=str(DEFAULT_DATA), help="Path to data.yaml")
+    p.add_argument("--model", default="yolo12m.pt",
+                   help="Pretrained checkpoint (auto-downloaded by Ultralytics).")
+    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--batch", type=int, default=-1,
+                   help="Batch size; -1 lets Ultralytics auto-pick the largest safe batch.")
+    p.add_argument("--epochs", type=int, default=150)
+    p.add_argument("--patience", type=int, default=25,
+                   help="Early-stopping patience in epochs.")
+    p.add_argument("--workers", type=int, default=4,
+                   help="DataLoader workers. Keep low on Windows + laptop CPUs.")
+    p.add_argument("--name", default="stage1_public",
+                   help="Run name under runs/detect/.")
+    p.add_argument("--project", default=str(DEFAULT_PROJECT))
+    p.add_argument("--resume", action="store_true",
+                   help="Resume the latest run with the same --name.")
+    p.add_argument("--device", default="0", help="GPU id, 'cpu', or 'mps'.")
+    p.add_argument("--cache", default="disk", choices=["ram", "disk", "false"],
+                   help="Image cache strategy. 'disk' is safest on a 6 GB GPU laptop.")
+    p.add_argument("--no-export", action="store_true",
+                   help="Skip the ONNX export step at the end.")
+    return p.parse_args()
 
-    # 检查是否存在检查点
-    checkpoint_path = "yolov11_checkpoint.pth"
-    start_epoch = 0
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0)
-        print(f"从第 {start_epoch} 轮开始继续训练")
 
-    # 开始训练
-    print('''
-          ====================
-          开始模型训练...
-          ====================
-          ''')
-    for epoch in range(start_epoch, config.epochs):
-        # 每个epoch开始时更新学习率
-        scheduler.step()
+def assert_cuda(device: str) -> None:
+    if device in {"cpu", "mps"}:
+        return
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "CUDA is not available. Install a CUDA build of PyTorch matching your driver, "
+            "e.g.: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121"
+        )
+    print(f"Using NVIDIA GPU: {torch.cuda.get_device_name(int(device))}")
 
-        # 训练过程代码...
-        results = model.train(**train_args)
 
-        # 保存检查点
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'epoch': epoch + 1,
-        }, checkpoint_path)
+def main() -> None:
+    args = parse_args()
+    assert_cuda(args.device)
+    data_path = normalize_data_yaml(Path(args.data))
 
-    return model
-# ----------------------------
-# 主程序
-# ----------------------------
-if __name__ == '__main__':
-    config = CustomConfig()
-    prepare_dataset(config)
-    model = train_yolo(config)
-    
-    # 导出模型
-    model.export(format='onnx', imgsz=config.img_size)
-    
-    # 验证结果
+    model = YOLO(args.model)
+
+    cache_arg: bool | str
+    cache_arg = False if args.cache == "false" else args.cache
+
+    model.train(
+        data=data_path,
+        epochs=args.epochs,
+        imgsz=args.imgsz,
+        batch=args.batch,
+        device=args.device,
+        workers=args.workers,
+        cache=cache_arg,
+        amp=True,
+        cos_lr=True,
+        close_mosaic=15,
+        patience=args.patience,
+        optimizer="AdamW",
+        lr0=1e-3,
+        lrf=0.01,
+        weight_decay=5e-4,
+        warmup_epochs=3.0,
+        # Augmentations tuned for top-down pool footage. Color jitter is
+        # moderate (water hue matters), geometric jitter is mild (camera is
+        # mounted, not handheld), copy-paste boosts the under-represented
+        # "Person out of water" class.
+        hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
+        degrees=5.0, translate=0.1, scale=0.5, shear=2.0, perspective=0.0005,
+        fliplr=0.5, flipud=0.0,
+        mosaic=1.0, mixup=0.15, copy_paste=0.3,
+        erasing=0.4,
+        multi_scale=False,
+        seed=0,
+        deterministic=True,
+        project=args.project,
+        name=args.name,
+        exist_ok=args.resume,
+        resume=args.resume,
+        plots=True,
+    )
+
     metrics = model.val()
-    print(f"验证结果:mAP@0.5={metrics.box.map:.2f}, mAP@0.5:0.95={metrics.box.map50:.2f}")
+    print(
+        f"\nValidation results — mAP50={metrics.box.map50:.3f}  "
+        f"mAP50-95={metrics.box.map:.3f}  "
+        f"P={metrics.box.mp:.3f}  R={metrics.box.mr:.3f}"
+    )
+
+    if not args.no_export:
+        export_path = model.export(
+            format="onnx",
+            imgsz=args.imgsz,
+            simplify=True,
+            dynamic=True,
+            opset=17,
+        )
+        print(f"Exported ONNX model to: {export_path}")
+
+
+if __name__ == "__main__":
+    main()

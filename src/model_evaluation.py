@@ -1,172 +1,160 @@
-import os
+"""Evaluate a trained YOLO checkpoint on a YOLO dataset's val/test split.
+
+This is a thin wrapper around ``YOLO.val()`` that prints a tidy per-class
+report and writes a CSV / JSON summary, so we can compare runs without having
+to dig through ``runs/detect/<name>/`` by hand.
+
+Typical usage:
+
+    python src/model_evaluation.py --weights runs/detect/stage1_public/weights/best.pt
+    python src/model_evaluation.py --weights best.pt/best.pt \
+        --data uninorte_dataset/data.yaml --split val --imgsz 640
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from pathlib import Path
+
 import yaml
-import cv2
-import numpy as np
 from ultralytics import YOLO
-from tqdm import tqdm
-from collections import defaultdict
 
-# ----------------------------
-# 配置参数
-# ----------------------------
-CONF_THRESH = 0.25  # 置信度阈值
-IOU_THRESH = 0.5    # IoU阈值
-NUM_IMAGES = 2     # 选择图片数量
-
-# ----------------------------
-# 初始化模型和数据集
-# ----------------------------
-model = YOLO("yolo11n.pt")
-script_dir = os.path.dirname(os.path.abspath(__file__))
-data_yaml_path = os.path.join(script_dir, "dataset", "data.yaml")
-
-with open(data_yaml_path, "r") as f:
-    data = yaml.safe_load(f)
-    
-base_dir = os.path.dirname(data_yaml_path)
-test_dir = os.path.join(base_dir, data["test"], "images")
-test_label_dir = os.path.join(base_dir, "test/labels")
-class_names = data["names"]
-
-# ----------------------------
-# 获取测试图片列表
-# ----------------------------
-test_images = [f for f in os.listdir(test_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-selected_images = np.random.choice(test_images, min(NUM_IMAGES, len(test_images)), replace=False)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATA = REPO_ROOT / "dataset" / "data.yaml"
 
 
-# ----------------------------
-# 评估指标容器
-# ----------------------------
-metrics = {
-    "total": defaultdict(int),
-    "classes": defaultdict(lambda: {
-        "TP": 0, "FP": 0, "FN": 0,
-        "precision": 0, "recall": 0, "f1": 0
-    })
-}
+def normalize_data_yaml(data_yaml: Path) -> str:
+    """Rewrite ``data_yaml`` with an absolute ``path:`` and return the new path.
 
-# ----------------------------
-# 处理函数
-# ----------------------------
-def parse_label(label_path, img_width, img_height):
-    boxes = []
-    with open(label_path, 'r') as f:
-        for line in f.readlines():
-            class_id, xc, yc, w, h = map(float, line.strip().split())
-            x1 = (xc - w/2) * img_width
-            y1 = (yc - h/2) * img_height
-            x2 = (xc + w/2) * img_width
-            y2 = (yc + h/2) * img_height
-            boxes.append([int(class_id), x1, y1, x2, y2])
-    return boxes
+    See the docstring in ``src/train.py`` for why this is necessary.
+    """
 
-def calculate_iou(box1, box2):
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    
-    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-    box1_area = (box1[2]-box1[0])*(box1[3]-box1[1])
-    box2_area = (box2[2]-box2[0])*(box2[3]-box2[1])
-    
-    return inter_area / (box1_area + box2_area - inter_area + 1e-6)
+    data_yaml = data_yaml.resolve()
+    if not data_yaml.is_file():
+        raise SystemExit(f"data.yaml not found: {data_yaml}")
 
-# ----------------------------
-# 主处理流程
-# ----------------------------
-for img_name in tqdm(selected_images, desc="Processing Images"):
-    # 读取图片
-    img_path = os.path.join(test_dir, img_name)
-    img = cv2.imread(img_path)
-    h, w = img.shape[:2]
-    
-    # 获取对应标签
-    label_path = os.path.join(test_label_dir, os.path.splitext(img_name)[0] + ".txt")
-    gt_boxes = parse_label(label_path, w, h) if os.path.exists(label_path) else []
-    
-    # 模型预测
-    results = model.predict(img, conf=CONF_THRESH)
-    detections = []
-    for result in results:
-        for box in result.boxes:
-            xyxy = box.xyxy.cpu().numpy()[0]
-            class_id = int(box.cls)
-            conf = float(box.conf)
-            detections.append([class_id, conf, *xyxy])
-    
-    # 匹配检测结果
-    matched_gt = set()
-    for det in sorted(detections, key=lambda x: -x[1]):
-        max_iou = 0
-        match_idx = -1
-        for i, gt in enumerate(gt_boxes):
-            if i in matched_gt:
-                continue
-            iou = calculate_iou(det[2:], gt[1:])
-            if iou > max_iou and det[0] == gt[0]:
-                max_iou = iou
-                match_idx = i
-                
-        if max_iou >= IOU_THRESH:
-            metrics["classes"][det[0]]["TP"] += 1
-            metrics["total"]["TP"] += 1
-            matched_gt.add(match_idx)
+    with data_yaml.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    raw_path = cfg.get("path", ".")
+    base = Path(raw_path)
+    if not base.is_absolute():
+        candidate = (data_yaml.parent / base).resolve()
+        base = candidate if candidate.is_dir() else data_yaml.parent
+    cfg["path"] = str(base)
+
+    out_path = data_yaml.parent / "data.normalized.yaml"
+    with out_path.open("w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    return str(out_path)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Evaluate a YOLO checkpoint and dump a summary report.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--weights", required=True,
+                   help="Path to the .pt checkpoint to evaluate.")
+    p.add_argument("--data", default=str(DEFAULT_DATA),
+                   help="Path to the dataset's data.yaml.")
+    p.add_argument("--split", default="val", choices=["val", "test"])
+    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--conf", type=float, default=0.001,
+                   help="Low confidence threshold for full PR-curve evaluation.")
+    p.add_argument("--iou", type=float, default=0.6,
+                   help="IoU threshold for NMS during validation.")
+    p.add_argument("--device", default="0")
+    p.add_argument("--half", action="store_true",
+                   help="Run validation in FP16 (faster on the RTX 3050).")
+    p.add_argument("--out-dir", default=None,
+                   help="Where to save report.csv / report.json. "
+                        "Defaults to the run's save_dir.")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    weights = Path(args.weights)
+    if not weights.is_file():
+        raise SystemExit(f"Weights not found: {weights}")
+    data_path = normalize_data_yaml(Path(args.data))
+
+    model = YOLO(str(weights))
+    metrics = model.val(
+        data=data_path,
+        split=args.split,
+        imgsz=args.imgsz,
+        batch=args.batch,
+        conf=args.conf,
+        iou=args.iou,
+        device=args.device,
+        half=args.half,
+        plots=True,
+        save_json=True,
+    )
+
+    names = model.names
+    per_class = []
+    map50_per_cls = metrics.box.maps  # mAP50-95 per class
+    p_per_cls = getattr(metrics.box, "p", None)
+    r_per_cls = getattr(metrics.box, "r", None)
+
+    for cls_id, cls_name in names.items():
+        row = {
+            "class_id": int(cls_id),
+            "class": cls_name,
+            "mAP50_95": float(map50_per_cls[cls_id]) if cls_id < len(map50_per_cls) else None,
+        }
+        if p_per_cls is not None and cls_id < len(p_per_cls):
+            row["precision"] = float(p_per_cls[cls_id])
+        if r_per_cls is not None and cls_id < len(r_per_cls):
+            row["recall"] = float(r_per_cls[cls_id])
+        per_class.append(row)
+
+    overall = {
+        "mAP50": float(metrics.box.map50),
+        "mAP50_95": float(metrics.box.map),
+        "precision": float(metrics.box.mp),
+        "recall": float(metrics.box.mr),
+        "weights": str(weights),
+        "data": args.data,
+        "split": args.split,
+        "imgsz": args.imgsz,
+    }
+
+    print("\n=== Overall ===")
+    for k, v in overall.items():
+        if isinstance(v, float):
+            print(f"  {k:<10} {v:.4f}")
         else:
-            metrics["classes"][det[0]]["FP"] += 1
-            metrics["total"]["FP"] += 1
-    
-    # 统计漏检
-    metrics["total"]["FN"] += len(gt_boxes) - len(matched_gt)
-    for gt in gt_boxes:
-        if gt[0] not in [det[0] for det in detections]:
-            metrics["classes"][gt[0]]["FN"] += 1
+            print(f"  {k:<10} {v}")
 
-# ----------------------------
-# 计算指标
-# ----------------------------
-def calculate_metrics(stats):
-    precision = stats["TP"] / (stats["TP"] + stats["FP"] + 1e-6)
-    recall = stats["TP"] / (stats["TP"] + stats["FN"] + 1e-6)
-    f1 = 2 * (precision * recall) / (precision + recall + 1e-6)
-    return precision, recall, f1
+    print("\n=== Per class ===")
+    print(f"{'class':<25}{'P':>10}{'R':>10}{'mAP50-95':>12}")
+    for row in per_class:
+        p = f"{row.get('precision', 0):.3f}" if "precision" in row else "  -  "
+        r = f"{row.get('recall', 0):.3f}" if "recall" in row else "  -  "
+        m = f"{row.get('mAP50_95', 0):.3f}"
+        print(f"{row['class']:<25}{p:>10}{r:>10}{m:>12}")
 
-# 总体指标
-total_precision, total_recall, total_f1 = calculate_metrics(metrics["total"])
-metrics["total"].update({
-    "precision": total_precision,
-    "recall": total_recall,
-    "f1": total_f1
-})
+    out_dir = Path(args.out_dir) if args.out_dir else Path(metrics.save_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with (out_dir / "report.json").open("w", encoding="utf-8") as f:
+        json.dump({"overall": overall, "per_class": per_class}, f, indent=2)
+    with (out_dir / "report.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["class_id", "class", "precision", "recall", "mAP50_95"],
+        )
+        writer.writeheader()
+        for row in per_class:
+            writer.writerow({k: row.get(k) for k in writer.fieldnames})
+    print(f"\nSaved JSON / CSV report to: {out_dir}")
 
-# 分类指标
-for class_id in metrics["classes"]:
-    stats = metrics["classes"][class_id]
-    precision, recall, f1 = calculate_metrics(stats)
-    stats.update({
-        "precision": precision,
-        "recall": recall,
-        "f1": f1
-    })
 
-# ----------------------------
-# 生成报告
-# ----------------------------
-print("\n\n评估报告: ")
-print(f"测试图片数量: {len(selected_images)}")
-print(f"总检测数: {metrics['total']['TP'] + metrics['total']['FP']}")
-print(f"总真实标注数: {metrics['total']['TP'] + metrics['total']['FN']}")
-print(f"全局精确率: {metrics['total']['precision']:.2%}")
-print(f"全局召回率: {metrics['total']['recall']:.2%}")
-print(f"全局F1分数: {metrics['total']['f1']:.2%}")
-
-print("\n分类别统计:")
-print(f"{'类别':<15} {'精确率':<10} {'召回率':<10} {'F1分数':<10} {'TP':<5} {'FP':<5} {'FN':<5}")
-for class_id in sorted(metrics["classes"]):
-    cls = metrics["classes"][class_id]
-    name = class_names[class_id]
-    print(f"{name:<15} {cls['precision']:.2%} {cls['recall']:.2%} {cls['f1']:.2%} "
-          f"{cls['TP']:<5} {cls['FP']:<5} {cls['FN']:<5}")
-    
-
+if __name__ == "__main__":
+    main()
