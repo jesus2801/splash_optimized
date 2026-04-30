@@ -44,13 +44,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", default=str(REPO_ROOT / "uninorte" / "results"))
     p.add_argument("--conf", type=float, default=0.4)
     p.add_argument("--iou", type=float, default=0.5)
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", type=int, default=960,
+                   help="Inference image size. Should match the value the "
+                        "checkpoint was trained at (960 by default).")
     p.add_argument("--device", default="0")
     p.add_argument("--half", action="store_true",
-                   help="Run inference in FP16 (faster on RTX 3050).")
+                   help="Run inference in FP16. Strongly recommended on the "
+                        "A5000 — it nearly halves inference latency with no "
+                        "measurable accuracy loss for this task.")
     p.add_argument("--vid-stride", type=int, default=2,
                    help="Process every Nth frame (1 = every frame). Pool footage at "
-                        "30 fps does not need every frame for drowning detection.")
+                        "30 fps does not need every frame for drowning detection. "
+                        "On the A5000 you can comfortably set this to 1 if you "
+                        "want every-frame coverage.")
     p.add_argument("--smooth-window", type=int, default=10,
                    help="Per-track sliding window length (in processed frames).")
     p.add_argument("--drowning-threshold", type=int, default=5,

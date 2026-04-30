@@ -61,15 +61,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data", default=str(DEFAULT_DATA),
                    help="Path to the dataset's data.yaml.")
     p.add_argument("--split", default="val", choices=["val", "test"])
-    p.add_argument("--imgsz", type=int, default=640)
-    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--imgsz", type=int, default=960,
+                   help="Validation image size. Should match the training imgsz "
+                        "(960 by default for the A5000 16 GB).")
+    p.add_argument("--batch", type=int, default=32,
+                   help="Validation batch size. 32 fits comfortably on the "
+                        "A5000 16 GB at imgsz=960; lower it for bigger imgsz.")
     p.add_argument("--conf", type=float, default=0.001,
                    help="Low confidence threshold for full PR-curve evaluation.")
     p.add_argument("--iou", type=float, default=0.6,
                    help="IoU threshold for NMS during validation.")
     p.add_argument("--device", default="0")
     p.add_argument("--half", action="store_true",
-                   help="Run validation in FP16 (faster on the RTX 3050).")
+                   help="Run validation in FP16 (faster on the A5000).")
     p.add_argument("--out-dir", default=None,
                    help="Where to save report.csv / report.json. "
                         "Defaults to the run's save_dir.")

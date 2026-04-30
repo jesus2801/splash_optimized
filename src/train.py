@@ -9,9 +9,14 @@ Typical usage from the repo root:
 
     python src/train.py
     python src/train.py --model yolo12s.pt --epochs 80   # fast baseline
+    python src/train.py --model yolo12x.pt               # max-quality (slower)
     python src/train.py --resume                         # resume last run
 
-The defaults are tuned for an RTX 3050 6 GB Laptop GPU at ``imgsz=640``.
+The defaults are tuned for an RTX A5000 16 GB Laptop GPU at ``imgsz=960``
+with the ``yolo12l`` backbone. Compared to the previous RTX 3050 6 GB
+defaults this trades a bit of training time per epoch for noticeably better
+recall on the small ``Person out of water`` class (whose instances tend to
+occupy very few pixels at 640px).
 """
 
 from __future__ import annotations
@@ -69,16 +74,22 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--data", default=str(DEFAULT_DATA), help="Path to data.yaml")
-    p.add_argument("--model", default="yolo12m.pt",
-                   help="Pretrained checkpoint (auto-downloaded by Ultralytics).")
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--model", default="yolo12l.pt",
+                   help="Pretrained checkpoint (auto-downloaded by Ultralytics). "
+                        "yolo12l is the default for the A5000 16 GB; use yolo12m "
+                        "for faster iteration or yolo12x for max accuracy.")
+    p.add_argument("--imgsz", type=int, default=960,
+                   help="Training image size. 960 is tuned for the A5000 16 GB; "
+                        "drop to 640 for faster epochs or push to 1280 for the "
+                        "absolute best small-object recall.")
     p.add_argument("--batch", type=int, default=-1,
                    help="Batch size; -1 lets Ultralytics auto-pick the largest safe batch.")
     p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--patience", type=int, default=25,
                    help="Early-stopping patience in epochs.")
-    p.add_argument("--workers", type=int, default=4,
-                   help="DataLoader workers. Keep low on Windows + laptop CPUs.")
+    p.add_argument("--workers", type=int, default=8,
+                   help="DataLoader workers. 8 is a good fit for laptop CPUs with "
+                        "the A5000 feeding speed; lower it if you see CPU thrash.")
     p.add_argument("--name", default="stage1_public",
                    help="Run name under runs/detect/.")
     p.add_argument("--project", default=str(DEFAULT_PROJECT))
@@ -86,9 +97,25 @@ def parse_args() -> argparse.Namespace:
                    help="Resume the latest run with the same --name.")
     p.add_argument("--device", default="0", help="GPU id, 'cpu', or 'mps'.")
     p.add_argument("--cache", default="disk", choices=["ram", "disk", "false"],
-                   help="Image cache strategy. 'disk' is safest on a 6 GB GPU laptop.")
+                   help="Image cache strategy. 'disk' is the safest default; "
+                        "'ram' is fine on machines with >=32 GB system RAM and "
+                        "noticeably reduces dataloader stalls.")
+    p.add_argument("--multi-scale", action="store_true",
+                   help="Randomly resize training images by +/-50%% per batch. "
+                        "Now feasible on the A5000's 16 GB but can OOM the "
+                        "auto-batcher at large --imgsz; opt in once you have a "
+                        "stable batch size.")
+    p.add_argument("--compile", action="store_true",
+                   help="Enable torch.compile for the model. Can give a 5-15%% "
+                        "speedup on Ampere+ GPUs but adds 1-2 min of warmup on "
+                        "the first epoch and is occasionally flaky on Windows.")
+    p.add_argument("--export-format", default="onnx",
+                   choices=["onnx", "engine", "torchscript", "none"],
+                   help="Export format after training. 'engine' is TensorRT FP16, "
+                        "the fastest option for inference on the A5000 itself; "
+                        "'onnx' is the most portable; 'none' skips export.")
     p.add_argument("--no-export", action="store_true",
-                   help="Skip the ONNX export step at the end.")
+                   help="Skip the export step at the end (alias for --export-format none).")
     return p.parse_args()
 
 
@@ -139,7 +166,8 @@ def main() -> None:
         fliplr=0.5, flipud=0.0,
         mosaic=1.0, mixup=0.15, copy_paste=0.3,
         erasing=0.4,
-        multi_scale=False,
+        multi_scale=args.multi_scale,
+        compile=args.compile,
         seed=0,
         deterministic=True,
         project=args.project,
@@ -156,15 +184,23 @@ def main() -> None:
         f"P={metrics.box.mp:.3f}  R={metrics.box.mr:.3f}"
     )
 
-    if not args.no_export:
-        export_path = model.export(
-            format="onnx",
-            imgsz=args.imgsz,
-            simplify=True,
-            dynamic=True,
-            opset=17,
-        )
-        print(f"Exported ONNX model to: {export_path}")
+    export_format = "none" if args.no_export else args.export_format
+    if export_format != "none":
+        # TensorRT engines are device-specific and don't support dynamic shapes
+        # in the same way ONNX does, so we hard-code half=True / dynamic=False
+        # for that path. ONNX stays dynamic so the exported model is reusable
+        # at any imgsz / batch.
+        export_kwargs = {
+            "format": export_format,
+            "imgsz": args.imgsz,
+            "simplify": True,
+        }
+        if export_format == "engine":
+            export_kwargs.update(half=True, dynamic=False, device=args.device)
+        elif export_format == "onnx":
+            export_kwargs.update(dynamic=True, opset=17)
+        export_path = model.export(**export_kwargs)
+        print(f"Exported {export_format} model to: {export_path}")
 
 
 if __name__ == "__main__":

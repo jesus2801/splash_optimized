@@ -15,6 +15,9 @@ Typical usage from the repo root:
 
     python src/finetune.py --weights runs/detect/stage1_public/weights/best.pt
     python src/finetune.py --weights best.pt/best.pt --epochs 80 --freeze 10
+
+Defaults are tuned for an RTX A5000 16 GB Laptop GPU at ``imgsz=960`` so the
+fine-tune resolution matches the stage-1 training resolution.
 """
 
 from __future__ import annotations
@@ -67,12 +70,15 @@ def parse_args() -> argparse.Namespace:
                    help="Path to the stage-1 best.pt to fine-tune from.")
     p.add_argument("--data", default=str(DEFAULT_DATA),
                    help="Path to the Uninorte data.yaml.")
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", type=int, default=960,
+                   help="Fine-tune image size. Should match the stage-1 imgsz "
+                        "(also 960 by default) so the head-resolution doesn't "
+                        "change between stages.")
     p.add_argument("--batch", type=int, default=-1)
     p.add_argument("--epochs", type=int, default=60,
                    help="Fewer epochs than stage 1 — we are adapting, not re-learning.")
     p.add_argument("--patience", type=int, default=15)
-    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--workers", type=int, default=8)
     p.add_argument("--freeze", type=int, default=10,
                    help="Number of leading layers to freeze (backbone). "
                         "10 keeps the YOLOv12 backbone fixed; 0 trains everything.")
@@ -84,8 +90,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--name", default="stage2_uninorte")
     p.add_argument("--project", default=str(DEFAULT_PROJECT))
     p.add_argument("--device", default="0")
-    p.add_argument("--cache", default="disk", choices=["ram", "disk", "false"])
-    p.add_argument("--no-export", action="store_true")
+    p.add_argument("--cache", default="disk", choices=["ram", "disk", "false"],
+                   help="Image cache strategy. 'disk' is the safe default; "
+                        "'ram' is fine on machines with >=32 GB system RAM.")
+    p.add_argument("--compile", action="store_true",
+                   help="Enable torch.compile for the model (Ampere+ speedup).")
+    p.add_argument("--export-format", default="onnx",
+                   choices=["onnx", "engine", "torchscript", "none"],
+                   help="Export format after fine-tuning. 'engine' is TensorRT "
+                        "FP16, the fastest option for inference on the A5000.")
+    p.add_argument("--no-export", action="store_true",
+                   help="Skip the export step (alias for --export-format none).")
     p.add_argument("--resume", action="store_true")
     return p.parse_args()
 
@@ -151,6 +166,7 @@ def main() -> None:
         mosaic=0.5, mixup=0.05, copy_paste=0.2,
         erasing=0.2,
         multi_scale=False,
+        compile=args.compile,
         seed=0,
         deterministic=True,
         project=args.project,
@@ -167,19 +183,24 @@ def main() -> None:
         f"P={metrics.box.mp:.3f}  R={metrics.box.mr:.3f}"
     )
 
-    if not args.no_export:
-        export_path = model.export(
-            format="onnx",
-            imgsz=args.imgsz,
-            simplify=True,
-            dynamic=True,
-            opset=17,
-        )
-        print(f"Exported ONNX model to: {export_path}")
-        print(
-            "\nFor production inference on the RTX 3050 you can also export to TensorRT:\n"
-            "  yolo export model=<path-to-best.pt> format=engine half=True imgsz=640 device=0"
-        )
+    export_format = "none" if args.no_export else args.export_format
+    if export_format != "none":
+        export_kwargs = {
+            "format": export_format,
+            "imgsz": args.imgsz,
+            "simplify": True,
+        }
+        if export_format == "engine":
+            export_kwargs.update(half=True, dynamic=False, device=args.device)
+        elif export_format == "onnx":
+            export_kwargs.update(dynamic=True, opset=17)
+        export_path = model.export(**export_kwargs)
+        print(f"Exported {export_format} model to: {export_path}")
+        if export_format != "engine":
+            print(
+                "\nFor production inference on the RTX A5000 you can also export to TensorRT:\n"
+                f"  yolo export model=<path-to-best.pt> format=engine half=True imgsz={args.imgsz} device=0"
+            )
 
 
 if __name__ == "__main__":

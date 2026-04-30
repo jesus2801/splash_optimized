@@ -36,10 +36,14 @@ def parse_args() -> argparse.Namespace:
                    help="Output folder for annotated images and report.json.")
     p.add_argument("--conf", type=float, default=0.4)
     p.add_argument("--iou", type=float, default=0.5)
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", type=int, default=960,
+                   help="Inference image size. Should match the value the "
+                        "checkpoint was trained at (960 by default).")
     p.add_argument("--device", default="0")
     p.add_argument("--half", action="store_true",
-                   help="Run inference in FP16 (faster on RTX 3050).")
+                   help="Run inference in FP16. Strongly recommended on the "
+                        "A5000 — it nearly halves inference latency with no "
+                        "measurable accuracy loss for this task.")
     return p.parse_args()
 
 
