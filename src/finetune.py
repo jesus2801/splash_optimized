@@ -155,16 +155,17 @@ def assert_cuda(device: str) -> None:
 
 
 def setup_cuda_perf(device: str) -> None:
-    """Enable Ampere-class fast paths (TF32 matmul, cuDNN benchmark).
+    """Enable Ampere-class TF32 fast paths.
 
-    See ``src/train.py:setup_cuda_perf`` for the rationale.
+    See ``src/train.py:setup_cuda_perf`` for the rationale (and the reason
+    we deliberately do NOT touch ``cudnn.benchmark`` — it breaks
+    Ultralytics' AutoBatch).
     """
 
     if device in {"cpu", "mps"}:
         return
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
     try:
         torch.set_float32_matmul_precision("high")
     except AttributeError:

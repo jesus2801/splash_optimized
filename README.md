@@ -15,10 +15,12 @@ refactored for:
 
 - **YOLOv12** (with the new attention-centric backbone) instead of YOLOv11
 - **NVIDIA Ampere hardware**, with defaults tuned for an
-  **A100 40 GB on Google Colab** running `yolo12x` at `imgsz=1280`. The
-  previous RTX A5000 16 GB (`yolo12l` @ 960) and RTX 3050 6 GB
-  (`yolo12m` @ 640) recipes are still one CLI flag away — see the
-  fallback table below
+  **A100 40 GB on Google Colab Pro** running `yolo12l` at `imgsz=1280`
+  (the previous A5000 default was `yolo12l` @ 960 — same backbone,
+  bigger images, free quality bump from the A100's headroom). `yolo12x`
+  @ 1280 needs the 80 GB A100 slice on Pro+. The RTX A5000 16 GB and
+  RTX 3050 6 GB recipes are still one CLI flag away — see the fallback
+  table below
 - **Two-stage training**: a generic public-pool model first, then a
   domain-adaptation fine-tune on our actual Uninorte data
 - **Real-time inference** with object tracking + temporal smoothing, so
@@ -130,7 +132,7 @@ images along. Then:
 
 ```bash
 python src/data_analysis.py --name public                        # sanity-check
-python src/train.py                                              # default: yolo12x @ 1280 (A100)
+python src/train.py                                              # default: yolo12l @ 1280 (Colab A100 40 GB)
 ```
 
 Outputs land in `runs/detect/stage1_public/`. The best checkpoint is
@@ -139,33 +141,41 @@ Outputs land in `runs/detect/stage1_public/`. The best checkpoint is
 Useful options:
 
 ```bash
-python src/train.py --model yolo12l.pt --imgsz 960 --epochs 80 --name stage1_fast  # faster baseline
-python src/train.py --batch 0.85                                                   # push A100 mem to 85%
-python src/train.py --multi-scale                                                  # +/-50% imgsz jitter
-python src/train.py --compile                                                      # torch.compile (10-20% speedup)
-python src/train.py --export-format engine                                         # TensorRT FP16 after training
-python src/train.py --resume                                                       # resume after interruption
-python src/train.py --batch 16                                                     # if auto-batch picks too high
+python src/train.py --imgsz 960  --batch 32 --epochs 80 --name stage1_fast        # faster baseline
+python src/train.py --batch 16                                                    # explicit batch (skip auto-batch)
+python src/train.py --cache disk                                                  # safer than ram on retry-prone runs
+python src/train.py --multi-scale                                                 # +/-50% imgsz jitter
+python src/train.py --compile                                                     # torch.compile (10-20% speedup)
+python src/train.py --export-format engine                                        # TensorRT FP16 after training
+python src/train.py --resume                                                      # resume after interruption
 ```
 
-On a Colab A100 40 GB, `yolo12x` at `imgsz=1280` typically trains at 3–5
-minutes per epoch on ~5 k training images, so a full 150-epoch run is
-roughly 8–13 hours. With `patience=25` early-stopping it usually wraps in
-half that. **Keep the tab open** — Colab silently times sessions out
-after ~12 h of idle UI; if it disconnects mid-run, just re-run with
-`--resume` to pick up at the last checkpoint.
+On a Colab A100 40 GB, `yolo12l` at `imgsz=1280` typically trains at
+2–3 minutes per epoch on ~5 k training images, so a full 150-epoch run
+is roughly 5–8 hours. With `patience=25` early-stopping it usually wraps
+in 3–5. **Keep the tab open** — Colab silently times sessions out after
+~12 h of idle UI; if it disconnects mid-run, just re-run with `--resume`
+to pick up at the last checkpoint.
+
+> **Heads up on `--batch -1` (auto-batch).** Ultralytics' AutoBatch
+> probes VRAM with `cudnn.benchmark = False`. If you've enabled benchmark
+> mode somewhere upstream, AutoBatch silently falls back to a hard-coded
+> `batch=16`, which OOMs the bigger models at imgsz=1280. The repo's
+> `setup_cuda_perf()` deliberately leaves benchmark alone for this reason.
+> If AutoBatch still misbehaves on your machine, just pass `--batch 16`
+> (or whatever you measured) explicitly.
 
 #### GPU-fallback cheatsheet
 
-If you're not on Colab A100, override the defaults explicitly:
+If you're not on a Colab A100, override the defaults explicitly:
 
 | GPU                        | Recommended override                                                            |
 |----------------------------|---------------------------------------------------------------------------------|
 | **A100 40 GB** (default)   | *(no flags needed — repo defaults)*                                             |
-| A100 80 GB                 | `--batch 0.85` (use the extra VRAM)                                             |
-| RTX A5000 16 GB            | `--model yolo12l.pt --imgsz 960  --workers 8 --cache disk`                      |
-| RTX A6000 / 4090 24 GB     | `--model yolo12x.pt --imgsz 1024 --workers 12`                                  |
-| RTX 3050 6 GB              | `--model yolo12m.pt --imgsz 640  --workers 4 --cache disk --batch 4`            |
+| A100 80 GB (Colab Pro+)    | `--model yolo12x.pt --batch 16` (the extra VRAM unlocks the bigger model)       |
+| RTX A5000 16 GB            | `--imgsz 960 --workers 8 --cache disk --batch 8`                                |
+| RTX A6000 / 4090 24 GB     | `--batch 12` (or `--model yolo12x.pt --imgsz 1024`)                             |
+| RTX 3050 6 GB              | `--model yolo12m.pt --imgsz 640 --workers 4 --cache disk --batch 4`             |
 
 ### Stage 2 — fine-tune on the Uninorte dataset
 
@@ -250,11 +260,17 @@ you see false positives in busy multi-swimmer scenes.
   ~85% of VRAM instead of the conservative 60% default. Safe on Colab
   because nothing else competes for the GPU; not recommended on a shared
   workstation. The default (`--batch -1`) leaves headroom and is the
-  right call for the very first run.
-- **`--cache ram` is the new default.** Colab A100 hosts ship with ~50 GB
-  of system RAM and the public dataset fits comfortably; epoch starts are
-  noticeably faster than `--cache disk`. Drop to disk if you collect a
-  much larger Uninorte set.
+  right call for the very first run. **Caveat**: AutoBatch can fall back
+  to a hard-coded `batch=16` if `cudnn.benchmark` is true; if you see
+  that warning, pass `--batch <int>` explicitly.
+- **`--cache ram` is the new default.** Colab A100 hosts ship with ~80 GB
+  of system RAM and a 5 k-image dataset at imgsz=1280 needs ~25 GB; epoch
+  starts are noticeably faster than `--cache disk`. **However**: if your
+  first training attempt OOMs and Ultralytics retries with a smaller
+  batch, the previous RAM cache isn't always released — successive
+  retries chew through host RAM until caching silently disables itself.
+  If you hit that pattern, switch to `--cache disk`; the on-disk cache
+  is per-image and survives retries cleanly.
 - **`--workers 12`** matches the Colab A100 host's vCPU count. On a
   laptop or shared workstation with fewer cores, drop it to 8 or you
   starve the dataloader.

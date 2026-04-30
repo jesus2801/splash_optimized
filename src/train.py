@@ -13,18 +13,24 @@ Typical usage from the repo root:
     python src/train.py --resume                                     # resume last run
 
 The defaults are tuned for an **NVIDIA A100 40 GB** (the GPU exposed by
-Google Colab Pro / Colab Pro+) at ``imgsz=1280`` with the ``yolo12x``
-backbone. Compared to the previous RTX A5000 16 GB defaults
-(``yolo12l`` @ 960) this trades VRAM and CPU for noticeably better recall
-on the small ``Person out of water`` class — those instances tend to
-occupy very few pixels even in 1080p footage and benefit a lot from the
-extra resolution. Wall-clock per epoch on a Colab A100 is roughly the
-same as ``yolo12l`` @ 960 was on the A5000 (~3–5 min on ~5 k images),
-so the quality bump is essentially free.
+Google Colab Pro) at ``imgsz=1280`` with the ``yolo12l`` backbone.
+Compared to the previous RTX A5000 16 GB defaults (``yolo12l`` @ 960)
+we keep the same backbone and just push the resolution up to 1280, which
+gives the small ``Person out of water`` class noticeably more pixels to
+work with — that class's instances tend to occupy very few pixels even
+in 1080p footage. ``yolo12x`` @ 1280 was tempting but OOMs the 40 GB
+A100 at any sensible batch size; it only becomes viable on the 80 GB
+A100 (Colab Pro+) — see the GPU fallback table in the README.
 
-If you ever go back to a smaller card, drop in the previous defaults
-explicitly:
+Per-epoch wall-clock on a Colab A100 40 GB is roughly 2–3 minutes on
+~5 k images, so the full 150-epoch run finishes in 5–8 hours and
+``patience=25`` early-stopping usually wraps it in 3–5.
 
+If you go back to a smaller card or up to a beefier one, drop in the
+matching defaults explicitly:
+
+    # A100 80 GB (Colab Pro+) — fits the bigger model
+    python src/train.py --model yolo12x.pt --imgsz 1280 --batch 16
     # RTX A5000 16 GB
     python src/train.py --model yolo12l.pt --imgsz 960  --workers 8 --cache disk
     # RTX 3050 6 GB
@@ -102,11 +108,13 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--data", default=str(DEFAULT_DATA), help="Path to data.yaml")
-    p.add_argument("--model", default="yolo12x.pt",
+    p.add_argument("--model", default="yolo12l.pt",
                    help="Pretrained checkpoint (auto-downloaded by Ultralytics). "
-                        "yolo12x is the default for the Colab A100 40 GB; drop to "
-                        "yolo12l for ~2x faster epochs (still excellent quality), or "
-                        "yolo12m if you only have a 16 GB card.")
+                        "yolo12l is the default for the Colab A100 40 GB — the "
+                        "right balance of accuracy and VRAM at imgsz=1280. "
+                        "yolo12x only fits on an 80 GB A100 (Colab Pro+) at "
+                        "this resolution; yolo12m is the fallback for a 16 GB "
+                        "card.")
     p.add_argument("--imgsz", type=int, default=1280,
                    help="Training image size. 1280 is tuned for the A100 40 GB and "
                         "gives the small 'Person out of water' class a lot more "
@@ -176,17 +184,19 @@ def setup_cuda_perf(device: str) -> None:
     """Enable Ampere-class fast paths for matmul / convolutions.
 
     On the A100 (and the A5000) these knobs are essentially free quality-wise
-    but give a real throughput boost. Ultralytics already enables
-    ``cudnn.benchmark`` internally; we set the matmul-side TF32 flag too so
-    PyTorch's native FP32 matmuls (used outside of the AMP-cast forward
-    pass — e.g. in some loss terms) also use the Tensor Cores.
+    but give a real throughput boost. We deliberately do NOT touch
+    ``cudnn.benchmark`` here: Ultralytics' AutoBatch routine refuses to run
+    with benchmark mode on (it needs deterministic kernel selection to
+    measure real memory) and falls back to a hard-coded batch=16, which is
+    too big for yolo12x @ 1280 on a 40 GB A100 and triggers an OOM cascade.
+    Ultralytics flips benchmark on internally once training is past the
+    AutoBatch step.
     """
 
     if device in {"cpu", "mps"}:
         return
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
     try:
         torch.set_float32_matmul_precision("high")
     except AttributeError:

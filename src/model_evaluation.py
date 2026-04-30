@@ -102,7 +102,6 @@ def setup_cuda_perf(device: str) -> None:
         return
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
     try:
         torch.set_float32_matmul_precision("high")
     except AttributeError:
