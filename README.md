@@ -14,10 +14,11 @@ This repo is a fork of the original
 refactored for:
 
 - **YOLOv12** (with the new attention-centric backbone) instead of YOLOv11
-- **NVIDIA RTX hardware**, specifically tuned defaults for an RTX A5000
-  16 GB Laptop GPU running `yolo12l` at `imgsz=960` (drop in the previous
-  RTX 3050 6 GB defaults — `yolo12m` at `imgsz=640` — by passing
-  `--model yolo12m.pt --imgsz 640` if you ever go back to the smaller card)
+- **NVIDIA Ampere hardware**, with defaults tuned for an
+  **A100 40 GB on Google Colab** running `yolo12x` at `imgsz=1280`. The
+  previous RTX A5000 16 GB (`yolo12l` @ 960) and RTX 3050 6 GB
+  (`yolo12m` @ 640) recipes are still one CLI flag away — see the
+  fallback table below
 - **Two-stage training**: a generic public-pool model first, then a
   domain-adaptation fine-tune on our actual Uninorte data
 - **Real-time inference** with object tracking + temporal smoothing, so
@@ -51,6 +52,42 @@ splash/
 
 The training stack expects an NVIDIA GPU with a CUDA build of PyTorch.
 
+### A. Google Colab (recommended for training)
+
+Pick **Runtime → Change runtime type → GPU → A100** (Pro/Pro+ tier required).
+Then in a notebook cell:
+
+```bash
+# 1. Verify the A100 actually got attached
+!nvidia-smi | head -n 20
+
+# 2. Mount Drive so weights and datasets persist across sessions
+from google.colab import drive
+drive.mount("/content/drive")
+
+# 3. Clone the repo into Drive (one-time) and cd into it
+%cd /content/drive/MyDrive
+!git clone https://github.com/<your-fork>/splash.git || echo "already cloned"
+%cd splash
+
+# 4. Install Python deps. Colab already ships a CUDA PyTorch matching its
+#    driver, so we don't reinstall it — just the rest:
+!pip install -q -r requirements.txt
+```
+
+Verify CUDA + the A100 are visible to PyTorch:
+
+```python
+import torch
+print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
+# expected: True NVIDIA A100-SXM4-40GB
+```
+
+If `nvidia-smi` shows you got a T4 / V100 instead, change the runtime and
+restart — the defaults in this repo will OOM on a 16 GB card.
+
+### B. Local workstation / laptop
+
 ```bash
 # 1. Create a clean environment
 python -m venv .venv
@@ -62,24 +99,17 @@ python -m venv .venv
 #      cu121  for CUDA 12.1
 #      cu124  for CUDA 12.4
 #      cu126  for CUDA 12.6
-#    Check yours with `nvidia-smi`. The RTX A5000 Laptop typically runs cu121+.)
+#    Check yours with `nvidia-smi`. Most A100 / A5000 hosts run cu121+.)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 # 3. Install the rest
 pip install -r requirements.txt
 ```
 
-Verify CUDA is visible to PyTorch:
-
-```bash
-python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-# expected: True NVIDIA RTX A5000 Laptop GPU
-```
-
-For the fastest deployment-time inference on the A5000 you'll also want
-NVIDIA TensorRT installed so `yolo export ... format=engine` works. It's
-optional for training; install it only when you want to convert a `.pt`
-checkpoint into a `.engine` file:
+For the fastest deployment-time inference you'll also want NVIDIA TensorRT
+installed so `yolo export ... format=engine` works. It's optional for
+training; install it only when you want to convert a `.pt` checkpoint into a
+`.engine` file:
 
 ```bash
 pip install tensorrt
@@ -93,11 +123,14 @@ look like in *general*, stage 2 specializes that prior to *our* pool.
 
 ### Stage 1 — train on the public pool dataset
 
-Place the public-pool dataset under `dataset/` (it is gitignored). Then:
+Place the public-pool dataset under `dataset/` (it is gitignored). On
+Colab, the easiest path is to upload the Roboflow ZIP to Drive once and
+then symlink it under `dataset/` so re-cloning the repo doesn't drag the
+images along. Then:
 
 ```bash
 python src/data_analysis.py --name public                        # sanity-check
-python src/train.py                                              # default: yolo12l @ 960
+python src/train.py                                              # default: yolo12x @ 1280 (A100)
 ```
 
 Outputs land in `runs/detect/stage1_public/`. The best checkpoint is
@@ -106,27 +139,33 @@ Outputs land in `runs/detect/stage1_public/`. The best checkpoint is
 Useful options:
 
 ```bash
-python src/train.py --model yolo12s.pt --imgsz 640 --epochs 80 --name stage1_fast  # fast baseline
-python src/train.py --model yolo12x.pt                                             # max-quality
+python src/train.py --model yolo12l.pt --imgsz 960 --epochs 80 --name stage1_fast  # faster baseline
+python src/train.py --batch 0.85                                                   # push A100 mem to 85%
 python src/train.py --multi-scale                                                  # +/-50% imgsz jitter
-python src/train.py --compile                                                      # torch.compile speedup
+python src/train.py --compile                                                      # torch.compile (10-20% speedup)
 python src/train.py --export-format engine                                         # TensorRT FP16 after training
 python src/train.py --resume                                                       # resume after interruption
-python src/train.py --batch 8                                                      # if auto-batch picks too high
+python src/train.py --batch 16                                                     # if auto-batch picks too high
 ```
 
-On an RTX A5000 16 GB, `yolo12l` at `imgsz=960` typically trains at 4–7
-minutes per epoch on ~5k training images, so a full 150-epoch run is
-roughly 10–18 hours. With `patience=25` early-stopping it usually wraps in
-half that. Plan for an overnight run for the first cold pass.
+On a Colab A100 40 GB, `yolo12x` at `imgsz=1280` typically trains at 3–5
+minutes per epoch on ~5 k training images, so a full 150-epoch run is
+roughly 8–13 hours. With `patience=25` early-stopping it usually wraps in
+half that. **Keep the tab open** — Colab silently times sessions out
+after ~12 h of idle UI; if it disconnects mid-run, just re-run with
+`--resume` to pick up at the last checkpoint.
 
-If you ever need to fall back to the previous RTX 3050 6 GB defaults
-(`yolo12m` at `imgsz=640`, batch ≈ 4, `workers=4`), just pass them
-explicitly:
+#### GPU-fallback cheatsheet
 
-```bash
-python src/train.py --model yolo12m.pt --imgsz 640 --workers 4
-```
+If you're not on Colab A100, override the defaults explicitly:
+
+| GPU                        | Recommended override                                                            |
+|----------------------------|---------------------------------------------------------------------------------|
+| **A100 40 GB** (default)   | *(no flags needed — repo defaults)*                                             |
+| A100 80 GB                 | `--batch 0.85` (use the extra VRAM)                                             |
+| RTX A5000 16 GB            | `--model yolo12l.pt --imgsz 960  --workers 8 --cache disk`                      |
+| RTX A6000 / 4090 24 GB     | `--model yolo12x.pt --imgsz 1024 --workers 12`                                  |
+| RTX 3050 6 GB              | `--model yolo12m.pt --imgsz 640  --workers 4 --cache disk --batch 4`            |
 
 ### Stage 2 — fine-tune on the Uninorte dataset
 
@@ -142,14 +181,17 @@ python src/finetune.py --weights runs/detect/stage1_public/weights/best.pt
 Outputs land in `runs/detect/stage2_uninorte/`. This is the model you should
 deploy.
 
+The fine-tune defaults to the same `imgsz=1280` as stage 1 — keep them
+matched, or stage 1's head-resolution prior is mostly thrown away.
+
 Why fine-tune instead of training from scratch on the merged data?
 
 1. **You don't have enough Uninorte data yet.** Stage 1 gives you a strong
-   prior from ~7k public images, stage 2 adapts it with whatever volume you
+   prior from ~7 k public images, stage 2 adapts it with whatever volume you
    collect from our pool.
-2. **You want fast iteration on the Uninorte data.** Stage 2 trains in 1–3 h
-   with `--freeze 10`, so every time you label more frames you can ship a
-   new model the same day.
+2. **You want fast iteration on the Uninorte data.** Stage 2 trains in
+   ~30–90 min on the A100 with `--freeze 10`, so every time you label
+   more frames you can ship a new model the same hour.
 3. **It is the recipe with the highest expected accuracy.** Domain
    adaptation from a strong general detector to a small in-domain dataset
    beats training from scratch on small data.
@@ -164,7 +206,8 @@ python src/model_evaluation.py \
 ```
 
 This prints per-class P / R / mAP and writes `report.json` and `report.csv`
-next to the run's plots.
+next to the run's plots. FP16 evaluation is on by default on the A100 —
+pass `--no-half` if you want to compare against an FP32 baseline.
 
 ## 3. Inference / demos
 
@@ -174,8 +217,11 @@ final deployment surface.
 ### Image inference
 
 ```bash
-python scripts/predict.py --source uninorte/data --weights best.pt/best.pt --half
+python scripts/predict.py --source uninorte/data --weights best.pt/best.pt
 ```
+
+`--half` is on by default; pass `--no-half` to disable. Pass `--imgsz 960`
+if you're running an older A5000-trained checkpoint.
 
 ### Video inference with tracking and drowning alerts
 
@@ -183,47 +229,73 @@ python scripts/predict.py --source uninorte/data --weights best.pt/best.pt --hal
 python scripts/predict_video.py \
     --source uninorte/videos/drowning.mp4 \
     --weights runs/detect/stage2_uninorte/weights/best.pt \
-    --half --vid-stride 1 --drowning-threshold 5
+    --drowning-threshold 5
 ```
+
+Defaults: `--imgsz 1280 --half --vid-stride 1`. The A100 chews through
+1080p every-frame easily; if you're deploying on a smaller card or
+running multiple streams, drop `--vid-stride` to 2.
 
 The `--drowning-threshold N` flag is the one to tune for production: the
 script only fires an alert if a tracked person was classified as
 `Drowning` in at least N frames out of the last `--smooth-window`
-processed frames. With defaults `5 / 10`, that is roughly 1.5 seconds of
-sustained signal at 30 fps with `--vid-stride 2` — short enough to react,
-long enough to filter single-frame noise.
+processed frames. With defaults `5 / 10`, that is roughly 0.3 s of
+sustained signal at 30 fps with `--vid-stride 1` — short enough to react,
+long enough to filter single-frame noise. Bump the threshold to `7-8` if
+you see false positives in busy multi-swimmer scenes.
 
-On the A5000 every-frame processing (`--vid-stride 1`) is comfortable for
-1080p footage, so prefer it over the previous 3050 default of 2.
+## 4. Tips for the NVIDIA A100 (40 GB)
 
-## 4. Tips for the RTX A5000 (16 GB)
-
-- Still prefer `--batch -1` (auto-batch). 16 GB is comfortable for
-  `yolo12l @ 960` but autobatch keeps a safety margin so a parallel
-  Chrome / VS Code spike won't kill a 12-hour run.
-- `--cache disk` remains the safest default. With 32+ GB of system RAM
-  you can move to `--cache ram` for ~10–20% faster epoch starts; the
-  Windows CUDA-allocator race that hurt the 3050 is much rarer at A5000
-  memory levels but still possible, so verify on a short run first.
-- `--workers 8` is a good fit for laptop CPUs feeding the A5000. Push
-  to 12 only if your CPU has 12+ physical cores; otherwise the dataloader
-  starves the GPU instead of feeding it.
-- Use `--multi-scale` once you've confirmed your auto-batch survives
-  imgsz spikes up to 1.5× — it's a free +1–2 mAP50 on small classes but
-  can OOM the auto-batcher on the very first epoch.
-- For *inference* on the A5000, after you have a final model, export it
-  to TensorRT FP16 (this is now the recommended deployment path, not an
-  optional optimization):
+- **Auto-batch with a fraction.** `--batch 0.85` tells Ultralytics to fill
+  ~85% of VRAM instead of the conservative 60% default. Safe on Colab
+  because nothing else competes for the GPU; not recommended on a shared
+  workstation. The default (`--batch -1`) leaves headroom and is the
+  right call for the very first run.
+- **`--cache ram` is the new default.** Colab A100 hosts ship with ~50 GB
+  of system RAM and the public dataset fits comfortably; epoch starts are
+  noticeably faster than `--cache disk`. Drop to disk if you collect a
+  much larger Uninorte set.
+- **`--workers 12`** matches the Colab A100 host's vCPU count. On a
+  laptop or shared workstation with fewer cores, drop it to 8 or you
+  starve the dataloader.
+- **TF32 is enabled automatically.** The training/eval/inference scripts
+  flip `torch.backends.cuda.matmul.allow_tf32 = True` at startup so
+  Ampere Tensor Cores get used even for the FP32-cast paths inside the
+  model. Free 1.5–2× speedup on matmul-heavy ops.
+- **`--multi-scale` is now affordable.** With 40 GB of headroom the
+  +/-50% imgsz jitter rarely OOMs the auto-batcher; opt in once you have
+  a stable batch size from a previous run for an extra +1–2 mAP50 on
+  small classes.
+- **`--compile` is worth it.** torch.compile gives a 10–20% throughput
+  win on the A100 (vs 5–15% on the A5000). Costs 1–2 min of warmup on
+  the first epoch. Disable it if you hit the rare Ultralytics op that
+  isn't compile-safe.
+- **For deployment** (not training), export to TensorRT FP16 on whatever
+  GPU you'll actually deploy on — engine files are device-specific:
 
   ```bash
   yolo export model=runs/detect/stage2_uninorte/weights/best.pt \
-              format=engine half=True imgsz=960 device=0
+              format=engine half=True imgsz=1280 device=0
   ```
 
   Or just pass `--export-format engine` to `train.py` / `finetune.py` so
   it happens automatically at the end of training. Expect roughly 2–3×
-  the FPS of plain PyTorch inference on the A5000, which is the
-  difference between "demo" and "deployable monitoring".
+  the FPS of plain PyTorch inference, which is the difference between
+  "demo" and "deployable monitoring".
+
+### Colab gotchas
+
+- Sessions disconnect after a few hours of inactive UI even on Pro+.
+  Use `--resume` to pick up training from the last checkpoint.
+- Don't write outputs straight to `/content/` — that's wiped on every
+  session restart. Always train into a folder under
+  `/content/drive/MyDrive/...`.
+- `cv2.imshow` doesn't work in Colab; the `--show` flag in
+  `scripts/predict_video.py` is a no-op there. The annotated `.mp4` is
+  always written to `--output` regardless.
+- If the A100 you got reports < 40 GB free in `nvidia-smi`, you have a
+  partial-MIG slice. Restart the runtime and try again, or pass
+  `--batch 8 --imgsz 960` to fit a smaller slice.
 
 ## 5. License
 

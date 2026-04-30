@@ -16,8 +16,11 @@ Typical usage from the repo root:
     python src/finetune.py --weights runs/detect/stage1_public/weights/best.pt
     python src/finetune.py --weights best.pt/best.pt --epochs 80 --freeze 10
 
-Defaults are tuned for an RTX A5000 16 GB Laptop GPU at ``imgsz=960`` so the
-fine-tune resolution matches the stage-1 training resolution.
+Defaults are tuned for an **NVIDIA A100 40 GB** (Google Colab) at
+``imgsz=1280`` so the fine-tune resolution matches the stage-1 training
+resolution. If you trained stage 1 at a smaller imgsz on a smaller card,
+pass ``--imgsz`` here to match — the head's feature-pyramid scales need
+to line up across stages or you waste most of stage 1's prior.
 """
 
 from __future__ import annotations
@@ -61,6 +64,15 @@ def normalize_data_yaml(data_yaml: Path) -> str:
     return str(out_path)
 
 
+def batch_arg(value: str) -> int | float:
+    """See ``src/train.py:batch_arg`` for rationale (int / float / -1)."""
+
+    try:
+        return int(value)
+    except ValueError:
+        return float(value)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Fine-tune a stage-1 model on the Uninorte pool dataset (stage 2).",
@@ -70,15 +82,19 @@ def parse_args() -> argparse.Namespace:
                    help="Path to the stage-1 best.pt to fine-tune from.")
     p.add_argument("--data", default=str(DEFAULT_DATA),
                    help="Path to the Uninorte data.yaml.")
-    p.add_argument("--imgsz", type=int, default=960,
+    p.add_argument("--imgsz", type=int, default=1280,
                    help="Fine-tune image size. Should match the stage-1 imgsz "
-                        "(also 960 by default) so the head-resolution doesn't "
-                        "change between stages.")
-    p.add_argument("--batch", type=int, default=-1)
+                        "(also 1280 by default on the A100) so the head "
+                        "resolution doesn't change between stages.")
+    p.add_argument("--batch", type=batch_arg, default=-1,
+                   help="Batch size. -1 = auto (~60%% mem); pass 0.85 for an "
+                        "85%% memory budget on a dedicated A100; or an explicit int.")
     p.add_argument("--epochs", type=int, default=60,
                    help="Fewer epochs than stage 1 — we are adapting, not re-learning.")
     p.add_argument("--patience", type=int, default=15)
-    p.add_argument("--workers", type=int, default=8)
+    p.add_argument("--workers", type=int, default=12,
+                   help="DataLoader workers. 12 matches the Colab A100 host's "
+                        "vCPU count; drop to 8 on a 16 GB-card workstation.")
     p.add_argument("--freeze", type=int, default=10,
                    help="Number of leading layers to freeze (backbone). "
                         "10 keeps the YOLOv12 backbone fixed; 0 trains everything.")
@@ -90,15 +106,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--name", default="stage2_uninorte")
     p.add_argument("--project", default=str(DEFAULT_PROJECT))
     p.add_argument("--device", default="0")
-    p.add_argument("--cache", default="disk", choices=["ram", "disk", "false"],
-                   help="Image cache strategy. 'disk' is the safe default; "
-                        "'ram' is fine on machines with >=32 GB system RAM.")
+    p.add_argument("--cache", default="ram", choices=["ram", "disk", "false"],
+                   help="Image cache strategy. 'ram' is the default for Colab "
+                        "(host has plenty of RAM and the Uninorte dataset is "
+                        "small); drop to 'disk' on a low-RAM workstation.")
     p.add_argument("--compile", action="store_true",
-                   help="Enable torch.compile for the model (Ampere+ speedup).")
+                   help="Enable torch.compile for the model. ~10-20%% speedup on "
+                        "the A100; adds 1-2 min of warmup on the first epoch.")
     p.add_argument("--export-format", default="onnx",
                    choices=["onnx", "engine", "torchscript", "none"],
                    help="Export format after fine-tuning. 'engine' is TensorRT "
-                        "FP16, the fastest option for inference on the A5000.")
+                        "FP16 (best for inference on whatever GPU you deploy on); "
+                        "'onnx' is the most portable.")
     p.add_argument("--no-export", action="store_true",
                    help="Skip the export step (alias for --export-format none).")
     p.add_argument("--resume", action="store_true")
@@ -127,13 +146,36 @@ def assert_cuda(device: str) -> None:
         raise SystemExit(
             "CUDA is not available. Install a CUDA build of PyTorch matching your driver."
         )
-    print(f"Using NVIDIA GPU: {torch.cuda.get_device_name(int(device))}")
+    name = torch.cuda.get_device_name(int(device))
+    free, total = torch.cuda.mem_get_info(int(device))
+    print(
+        f"Using NVIDIA GPU: {name}  "
+        f"({free / 1e9:.1f} GB free / {total / 1e9:.1f} GB total)"
+    )
+
+
+def setup_cuda_perf(device: str) -> None:
+    """Enable Ampere-class fast paths (TF32 matmul, cuDNN benchmark).
+
+    See ``src/train.py:setup_cuda_perf`` for the rationale.
+    """
+
+    if device in {"cpu", "mps"}:
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
 
 
 def main() -> None:
     args = parse_args()
     assert_inputs(Path(args.weights), Path(args.data))
     assert_cuda(args.device)
+    setup_cuda_perf(args.device)
     data_path = normalize_data_yaml(Path(args.data))
 
     model = YOLO(args.weights)
@@ -198,7 +240,8 @@ def main() -> None:
         print(f"Exported {export_format} model to: {export_path}")
         if export_format != "engine":
             print(
-                "\nFor production inference on the RTX A5000 you can also export to TensorRT:\n"
+                "\nFor production inference, exporting to TensorRT on the target "
+                "GPU is the fastest path (engine files are device-specific):\n"
                 f"  yolo export model=<path-to-best.pt> format=engine half=True imgsz={args.imgsz} device=0"
             )
 

@@ -11,8 +11,10 @@ setup(
     version="2.0.0",
     description=(
         "YOLOv12-based drowning detection for the Uninorte training pool. "
-        "Fork of H20Saver, refactored for NVIDIA RTX hardware and a two-stage "
-        "training workflow (public dataset -> Uninorte fine-tune)."
+        "Fork of H20Saver, refactored for NVIDIA Ampere hardware (defaults "
+        "tuned for an A100 40 GB on Google Colab; falls back cleanly to a "
+        "16 GB RTX A5000 with --imgsz 960 --model yolo12l.pt) and a "
+        "two-stage training workflow (public dataset -> Uninorte fine-tune)."
     ),
     long_description=(REPO_ROOT / "README.md").read_text(encoding="utf-8"),
     long_description_content_type="text/markdown",

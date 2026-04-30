@@ -7,10 +7,15 @@ ByteTrack/BoT-SORT tracker to assign persistent IDs across frames and then
 applies a sliding-window majority vote per ID before deciding what to draw
 or alert on.
 
+Defaults assume the new A100 training defaults — ``imgsz=1280``, FP16 on,
+and ``--vid-stride 1`` (every frame). The A100 chews through 1080p
+every-frame easily; if you're deploying on a smaller card, drop
+``--vid-stride`` to 2 to halve the GPU work.
+
 Typical usage from the repo root:
 
     python scripts/predict_video.py --source uninorte/videos/drowning.mp4
-    python scripts/predict_video.py --source rtsp://camera --weights best.pt/best.pt --half
+    python scripts/predict_video.py --source rtsp://camera --weights best.pt/best.pt
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -44,19 +50,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", default=str(REPO_ROOT / "uninorte" / "results"))
     p.add_argument("--conf", type=float, default=0.4)
     p.add_argument("--iou", type=float, default=0.5)
-    p.add_argument("--imgsz", type=int, default=960,
+    p.add_argument("--imgsz", type=int, default=1280,
                    help="Inference image size. Should match the value the "
-                        "checkpoint was trained at (960 by default).")
+                        "checkpoint was trained at (1280 by default for A100 "
+                        "weights; pass 960 for older A5000 weights).")
     p.add_argument("--device", default="0")
-    p.add_argument("--half", action="store_true",
-                   help="Run inference in FP16. Strongly recommended on the "
-                        "A5000 — it nearly halves inference latency with no "
-                        "measurable accuracy loss for this task.")
-    p.add_argument("--vid-stride", type=int, default=2,
-                   help="Process every Nth frame (1 = every frame). Pool footage at "
-                        "30 fps does not need every frame for drowning detection. "
-                        "On the A5000 you can comfortably set this to 1 if you "
-                        "want every-frame coverage.")
+    p.add_argument("--half", dest="half", action="store_true", default=True,
+                   help="Run inference in FP16. ON by default — ~halves latency "
+                        "on Ampere GPUs (A100, A5000) with no measurable "
+                        "accuracy loss for this task.")
+    p.add_argument("--no-half", dest="half", action="store_false",
+                   help="Disable FP16 inference (FP32 baseline).")
+    p.add_argument("--vid-stride", type=int, default=1,
+                   help="Process every Nth frame (1 = every frame). The A100 "
+                        "is fast enough to handle 1080p every-frame; bump this "
+                        "to 2 if you're deploying on a smaller card or hitting "
+                        "I/O limits on RTSP.")
     p.add_argument("--smooth-window", type=int, default=10,
                    help="Per-track sliding window length (in processed frames).")
     p.add_argument("--drowning-threshold", type=int, default=5,
@@ -65,8 +74,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tracker", default="botsort.yaml",
                    choices=["botsort.yaml", "bytetrack.yaml"])
     p.add_argument("--show", action="store_true",
-                   help="Display annotated frames in a window while processing.")
+                   help="Display annotated frames in a window while processing. "
+                        "Disabled inside Colab — there's no GUI; the annotated "
+                        "video is always written to --output.")
     return p.parse_args()
+
+
+def setup_cuda_perf(device: str) -> None:
+    if device in {"cpu", "mps"}:
+        return
+    if not torch.cuda.is_available():
+        return
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
 
 
 def color_for(class_name: str, alert: bool) -> tuple[int, int, int]:
@@ -109,6 +130,7 @@ def main() -> None:
     args = parse_args()
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
+    setup_cuda_perf(args.device)
 
     weights = Path(args.weights)
     if not weights.is_file():
