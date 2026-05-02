@@ -177,7 +177,8 @@ def main() -> None:
     assert_inputs(Path(args.weights), Path(args.data))
     assert_cuda(args.device)
     setup_cuda_perf(args.device)
-    data_path = normalize_data_yaml(Path(args.data))
+    data_path = str(Path(args.data).resolve())
+    print(f"Using data yaml: {data_path}")
 
     model = YOLO(args.weights)
 
